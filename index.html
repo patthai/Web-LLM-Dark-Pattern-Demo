@@ -557,7 +557,7 @@ window.runAll = async function() {
   if(running) return;
   if(!dataset.length){ alert('Dataset not loaded yet.'); return; }
 
-  const sel = MODELS.filter((m,i)=> {
+  const sel = MODELS.filter((_,i)=>{
     const cb = document.getElementById(`cb${i}`);
     return cb && cb.checked && !cb.disabled;
   });
@@ -567,20 +567,44 @@ window.runAll = async function() {
   document.getElementById('runbtn').disabled=true;
   document.getElementById('stopbtn').disabled=false;
 
-  // Reset overview
+  // ── Phase 1: Download all selected models ────────────────
+  const toDownload = sel.filter(m => !isDL(m.id));
+  if(toDownload.length) {
+    setOS(`<strong>Phase 1/2 — Downloading ${toDownload.length} model(s)</strong>`);
+    for(let i=0; i<toDownload.length; i++){
+      if(stopReq) break;
+      const m = toDownload[i];
+      const mi = MODELS.findIndex(x=>x.id===m.id);
+      setOS(`Phase 1/2 — Downloading ${m.label} (${i+1}/${toDownload.length})…`);
+      setDot(mi,'run');
+      try {
+        await downloadModel(m);
+        markDL(m.id);
+        setDot(mi,'cached');
+        renderModelList();
+      } catch(e) {
+        console.error(`Download failed: ${m.label}`, e);
+        setDot(mi,'err');
+        setOS(`Download error (${m.label}): ${e.message}`);
+      }
+    }
+    if(stopReq){ endRun('Download stopped.'); return; }
+  }
+
+  // ── Phase 2: Run inference sequentially ──────────────────
   document.getElementById('panel-overview').innerHTML =
     `<div class="st">Model Comparison</div>
      <div id="comp-wrap"><div class="empty">Running…</div></div>`;
-  showTab('overview');
 
-  for(let i=0;i<sel.length;i++){
+  for(let i=0; i<sel.length; i++){
     if(stopReq) break;
     const m = sel[i];
     const mi = MODELS.findIndex(x=>x.id===m.id);
-    setOS(`Model ${i+1}/${sel.length}: <strong>${m.label}</strong>`);
+    const hasResume = !!(loadProg(m.id)?.nextIdx);
+    setOS(`Phase 2/2 — ${hasResume?'Resuming':'Inferring'} ${m.label} (${i+1}/${sel.length})`);
     setDot(mi,'run');
     try {
-      makeModelTab(m, i);
+      if(!runTabMap[i]) makeModelTab(m, i);
       await loadModel(m);
       if(!stopReq) await runInference(m, i);
       setDot(mi,'ok');
@@ -592,21 +616,39 @@ window.runAll = async function() {
     refreshComp(sel.slice(0,i+1).map(x=>x.id));
   }
 
-  const done = stopReq ? 'Stopped.' : `✓ Done — ${sel.length} model(s) evaluated.`;
-  setOS(done);
-  setProg('dl',0,''); setProg('inf',0,'');
+  endRun(stopReq ? 'Stopped.' : `✓ Done — ${sel.length} model(s) evaluated.`);
+};
+
+window.stopRun = function() { stopReq=true; setOS('Stopping after current row…'); };
+
+function endRun(msg) {
+  setOS(msg); setProg('dl',0,''); setProg('inf',0,'');
   running=false; stopReq=false;
   document.getElementById('runbtn').disabled=false;
   document.getElementById('stopbtn').disabled=true;
-};
-
-window.stopRun = function() { stopReq=true; setOS('Stopping…'); };
+}
 
 // ═══════════════════════════════════════════════════════════
 // Model loading
 // ═══════════════════════════════════════════════════════════
+
+// Phase 1: download weights to browser cache, then unload GPU memory
+async function downloadModel(m) {
+  setProg('dl',0,`Downloading ${m.label}…`);
+  if(engine){ try{ await engine.unload(); }catch(e){} engine=null; }
+  const eng = await webllm.CreateMLCEngine(m.id, {
+    initProgressCallback: rep => {
+      const pct = Math.round((rep.progress||0)*100);
+      setProg('dl', pct, rep.text||`${pct}%`);
+    }
+  });
+  await eng.unload(); // free GPU; weights stay in browser Cache API
+  setProg('dl',100,`${m.label} cached ✓`);
+}
+
+// Phase 2: load model from cache for inference
 async function loadModel(m) {
-  setProg('dl',0,`Loading ${m.label}…`);
+  setProg('dl',0,`Loading ${m.label} from cache…`);
   if(engine){ try{ await engine.unload(); }catch(e){} engine=null; }
   engine = await webllm.CreateMLCEngine(m.id, {
     initProgressCallback: rep => {
@@ -629,7 +671,28 @@ async function runInference(model, runIdx) {
   const limit = rowsOptEl.value === 'all' ? dataset.length : parseInt(rowsOptEl.value);
   const slice = dataset.slice(0, limit);
 
-  for(let i=0;i<slice.length;i++){
+  // ── Crash recovery: restore checkpoint ───────────────────
+  let startIdx = 0;
+  const checkpoint = loadProg(model.id);
+  if(checkpoint && checkpoint.nextIdx > 0 && checkpoint.rows?.length) {
+    const toRestore = Math.min(checkpoint.nextIdx, slice.length);
+    for(let i=0; i<toRestore; i++){
+      const r = expandRow(checkpoint.rows[i], slice[i]);
+      addRow(state, slice[i], r.pred, r.isOk);
+      rows.push(r);
+      appendTR(tid, rows.length, slice[i], r.pred, r.isOk);
+    }
+    startIdx = toRestore;
+    // Update metrics display for restored rows
+    const rm = calcMetrics(state);
+    document.getElementById(`mg-${tid}`).innerHTML = metricCards(rm);
+    const badge = document.getElementById(`tbadge-${tid}`);
+    if(badge) badge.textContent = `↩ ${(rm.correct/rm.total*100).toFixed(0)}%`;
+    setOS(`Resumed ${model.label} from row ${startIdx+1} / ${slice.length}`);
+  }
+
+  // ── Main inference loop ───────────────────────────────────
+  for(let i=startIdx; i<slice.length; i++){
     if(stopReq) break;
     const pct = Math.round(i/slice.length*100);
     setProg('inf', pct, `Row ${i+1}/${slice.length} (${pct}%)`);
@@ -658,18 +721,15 @@ async function runInference(model, runIdx) {
     addRow(state, row, pred, isOk);
     rows.push({row, pred, isOk});
 
-    // Append table row
-    appendTR(tid, i+1, row, pred, isOk);
+    // Checkpoint after every row so a crash can resume here
+    saveProg(model.id, i+1, rows);
 
-    // Update live metrics
+    appendTR(tid, rows.length, row, pred, isOk);
+
     const m = calcMetrics(state);
     document.getElementById(`mg-${tid}`).innerHTML = metricCards(m);
-
-    // Update tab badge
     const badge = document.getElementById(`tbadge-${tid}`);
     if(badge) badge.textContent = `${(m.correct/m.total*100).toFixed(0)}%`;
-
-    // Scroll last row into view
     const tbody = document.getElementById(`tb-body-${tid}`);
     if(tbody?.lastElementChild) tbody.lastElementChild.scrollIntoView({block:'nearest'});
   }
@@ -680,6 +740,8 @@ async function runInference(model, runIdx) {
 
   renderSummary(tid, model, final, rows.length);
   saveRun(model, rows, final);
+  clearProg(model.id); // run complete — discard checkpoint
+  renderModelList();   // refresh download/resume badges
   setProg('inf',100,`Done — ${rows.length} rows`);
 }
 
