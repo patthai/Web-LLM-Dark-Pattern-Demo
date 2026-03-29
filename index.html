@@ -263,13 +263,24 @@ const FALLBACK_MODELS = [
 
 // ── Model size utilities ─────────────────────────────────
 function parseSizeB(id) {
-  const m = id.match(/[_\-](\d+(?:\.\d+)?)(M|B)[_\-]/i);
-  if(!m) return 99;
-  return m[2].toUpperCase()==='B' ? parseFloat(m[1]) : parseFloat(m[1])/1000;
+  // Standard: -3B-, -1.5B-, -360M-
+  const m = id.match(/[_\-](\d+(?:\.\d+)?)(M|B)(?:[_\-]|$)/i);
+  if(m) return m[2].toUpperCase()==='B' ? parseFloat(m[1]) : parseFloat(m[1])/1000;
+  // Phi-3, Phi-3.5, Gemma-2 — version number ≈ param size in B
+  const v = id.match(/(?:Phi|Gemma)[_\-](\d+(?:\.\d+)?)[_\-]/i);
+  if(v) return parseFloat(v[1]);
+  return 99;
 }
 function parseSzStr(id) {
-  const m = id.match(/[_\-](\d+(?:\.\d+)?[MB])[_\-]/i);
-  return m ? m[1].toUpperCase() : '?';
+  const m = id.match(/[_\-](\d+(?:\.\d+)?[MB])(?:[_\-]|$)/i);
+  if(m) return m[1].toUpperCase();
+  const v = id.match(/(?:Phi|Gemma)[_\-](\d+(?:\.\d+)?)[_\-]/i);
+  if(v) return `~${v[1]}B`;
+  return '?';
+}
+function fmtVram(mb) {
+  if(mb == null || mb === 0) return '';
+  return mb >= 1024 ? `${(mb/1024).toFixed(1)} GB` : `${Math.round(mb)} MB`;
 }
 function shortLabel(id) {
   return id.replace(/-q4f\d+_\d+-MLC$/i,'').replace(/-MLC$/i,'');
@@ -391,6 +402,12 @@ function validateModels() {
       if (discovered.length) {
         MODELS = discovered.sort((a,b) => a.sizeB - b.sizeB);
       }
+      // Patch vram_required_MB onto discovered models from the config entry
+      const vramMap = {};
+      for (const entry of cfg.model_list) vramMap[entry.model_id] = entry.vram_required_MB;
+      MODELS.forEach(m => {
+        m.vramMB = vramMap[m.id] !== undefined ? vramMap[m.id] : null;
+      });
     }
   } catch(e) { console.warn('Could not read prebuiltAppConfig', e); }
 
@@ -427,6 +444,10 @@ function renderModelList() {
     document.getElementById('mlist').innerHTML='<div class="empty">Loading…</div>';
     return;
   }
+  // Preserve user checkbox state across re-renders
+  const prevState = {};
+  MODELS.forEach((m,i)=>{ const cb=document.getElementById(`cb${i}`); if(cb) prevState[m.id]=cb.checked; });
+
   document.getElementById('mlist').innerHTML = MODELS.map((m,i)=>{
     const unavail = availableModelIds.size>0 && !availableModelIds.has(m.id);
     const cached  = isDL(m.id);
@@ -443,11 +464,21 @@ function renderModelList() {
     else if(partial) tag=`<span style="color:var(--accent-light);font-size:10px" title="Resume from row ${prog.nextIdx}">↩${prog.nextIdx}</span>`;
     else if(cached)  tag=`<span style="color:var(--green);font-size:10px">⬇✓</span>`;
 
+    // Use saved state if user changed it; otherwise default-check ≤4B models
+    const defaultChecked = !unavail && m.sizeB <= 4;
+    const checked = m.id in prevState ? prevState[m.id] : defaultChecked;
+
+    // Show VRAM in MB/GB when available; always show param size alongside
+    const vramStr = fmtVram(m.vramMB);
+    const sizeDisplay = vramStr
+      ? `<span style="color:var(--text-dim)">${m.sz}</span> <span style="color:var(--yellow);font-size:10px">${vramStr}</span>`
+      : `<span>${m.sz}</span>`;
+
     return `<div class="mi" style="${unavail?'opacity:.35;':''}">
-      <input type="checkbox" id="cb${i}" ${unavail?'disabled':''} ${!unavail?'checked':''}>
+      <input type="checkbox" id="cb${i}" ${unavail?'disabled':''} ${checked?'checked':''}>
       <div class="dot ${dotCls}" id="dot${i}"></div>
       <label for="cb${i}">${m.label}</label>
-      <span class="sz">${m.sz}</span>
+      <span class="sz" title="VRAM required">${sizeDisplay}</span>
       ${tag}
     </div>`;
   }).join('');
