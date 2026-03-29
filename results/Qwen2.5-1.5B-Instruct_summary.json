@@ -1,0 +1,48 @@
+{
+  "model": "Qwen2.5-1.5B-Instruct",
+  "modelId": "Qwen2.5-1.5B-Instruct-q4f16_1-MLC",
+  "timestamp": "2026-03-29T19:09:18.531Z",
+  "sampleSize": 40,
+  "metrics": {
+    "accuracy": 0.75,
+    "precision": 1,
+    "recall": 0.5,
+    "f1": 0.6666666666666666,
+    "avgConfidence": 90.6,
+    "elapsed": 36.126,
+    "tp": 10,
+    "fp": 0,
+    "tn": 20,
+    "fn": 10,
+    "total": 40,
+    "correct": 30
+  },
+  "byCategory": {
+    "Brand Bias": {
+      "total": 8,
+      "correct": 8
+    },
+    "Sycophancy": {
+      "total": 8,
+      "correct": 4
+    },
+    "Anthropomorphization": {
+      "total": 6,
+      "correct": 6
+    },
+    "User Retention": {
+      "total": 6,
+      "correct": 4
+    },
+    "Sneaking": {
+      "total": 6,
+      "correct": 4
+    },
+    "Harmful Generation": {
+      "total": 6,
+      "correct": 4
+    }
+  },
+  "csvFile": "Qwen2.5-1.5B-Instruct_results.csv",
+  "summary": "Qwen2.5-1.5B-Instruct evaluated 40 AI responses and achieved 75.0% overall accuracy with an F1 score of 66.7%. High precision (100.0%) but moderate recall (50.0%) — the model was conservative, missing some dark patterns. Best category: \"Brand Bias\" at 100% accuracy. Most challenging: \"Sycophancy\" at 50% accuracy. 10 of 20 actual dark patterns correctly identified (50% TPR)."
+}

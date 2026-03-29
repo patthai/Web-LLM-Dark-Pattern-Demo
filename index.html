@@ -194,13 +194,16 @@ tr:last-child td{border-bottom:none}tr:hover td{background:rgba(255,255,255,.025
       <div class="rows-opt">
         <label for="rowssel">Rows:</label>
         <select id="rowssel">
-          <option value="10">10 (quick test)</option>
-          <option value="50">50</option>
-          <option value="all" selected>All (240)</option>
+          <option value="20" selected>20 (stratified)</option>
+          <option value="40">40 (stratified)</option>
+          <option value="50">50 (stratified)</option>
+          <option value="all">All (240)</option>
         </select>
       </div>
       <button class="btn btn-run" id="runbtn" onclick="runAll()">▶ Run All Selected</button>
       <button class="btn btn-stop" id="stopbtn" disabled onclick="stopRun()">■ Stop</button>
+      <button class="btn" style="margin-top:6px;background:var(--surface2);font-size:11px;width:100%" onclick="clearBrowserCache()" title="Free browser cache quota — disk copies in ./model/ are kept">🗑 Clear Browser Cache</button>
+      <div id="cache-status" style="font-size:10px;color:var(--text-dim);margin-top:4px;text-align:center"></div>
     </div>
 
     <div class="sec">
@@ -258,6 +261,27 @@ tr:last-child td{border-bottom:none}tr:hover td{background:rgba(255,255,255,.025
 </div>
 
 <script type="module">
+// ── Prevent browser Cache API quota errors ────────────────────
+// WebLLM stores model weights in the browser Cache API → QuotaExceededError.
+// Our proxy already caches everything on disk, so browser caching is redundant.
+// We patch Cache.prototype.put to a no-op so files are never stored in the
+// browser cache. WebLLM will always re-fetch from the proxy (fast, local disk).
+(function patchCacheNoPut() {
+  // Patch 1: Cache.prototype.put → no-op (most reliable)
+  if (typeof Cache !== 'undefined') {
+    Cache.prototype.put = async function() { return undefined; };
+  }
+  // Patch 2: CacheStorage.prototype.open → return a wrapped cache whose put is no-op
+  if (typeof CacheStorage !== 'undefined') {
+    const _origOpen = CacheStorage.prototype.open;
+    CacheStorage.prototype.open = async function(name) {
+      const cache = await _origOpen.call(this, name);
+      cache.put = async function() { return undefined; };
+      return cache;
+    };
+  }
+})();
+
 // Try multiple CDNs — esm.sh serves Node.js bundle which fails in browser
 let webllm;
 try {
@@ -409,6 +433,8 @@ renderModelList();
 loadCSV();
 renderSavedRuns();
 validateModels();
+showCacheUsage();
+loadResultsFromServer();
 
 function validateModels() {
   try {
@@ -773,8 +799,29 @@ function stopDLPoller() {
   if(card) card.classList.remove('active');
 }
 
+// Wipe the browser Cache API so WebLLM never hits quota.
+// Our proxy already has everything on disk — no data is lost.
+async function wipeBrowserCache() {
+  // 1. Clear Cache API (model weight files stored by WebLLM)
+  try {
+    const names = await caches.keys();
+    await Promise.all(names.map(n => caches.delete(n)));
+  } catch(e) {}
+
+  // 2. Clear IndexedDB (compiled WebGPU shader cache stored by WebLLM/TVM)
+  try {
+    const dbs = await indexedDB.databases();
+    await Promise.all(dbs.map(db => new Promise(res => {
+      const req = indexedDB.deleteDatabase(db.name);
+      req.onsuccess = res;
+      req.onerror   = res;  // resolve even on error
+    })));
+  } catch(e) {}
+}
+
 // Phase 1: download weights to browser cache, then unload GPU memory
 async function downloadModel(m) {
+  await wipeBrowserCache();   // prevent QuotaExceededError
   setProg('dl',0,`Downloading ${m.label}…`);
   startDLPoller(m.label);
   if(engine){ try{ await engine.unload(); }catch(e){} engine=null; }
@@ -798,6 +845,7 @@ async function downloadModel(m) {
 
 // Phase 2: load model from cache for inference
 async function loadModel(m) {
+  await wipeBrowserCache();   // prevent QuotaExceededError
   setProg('dl',0,`Loading ${m.label}…`);
   if(engine){ try{ await engine.unload(); }catch(e){} engine=null; }
   const appCfg = buildAppConfig(m.id);
@@ -820,8 +868,7 @@ async function runInference(model, runIdx) {
   const rows = [];
 
   const rowsOptEl = document.getElementById('rowssel');
-  const limit = rowsOptEl.value === 'all' ? dataset.length : parseInt(rowsOptEl.value);
-  const slice = dataset.slice(0, limit);
+  const slice = sampleDataset(rowsOptEl.value);
 
   // ── Crash recovery: restore checkpoint ───────────────────
   let startIdx = 0;
@@ -891,7 +938,7 @@ async function runInference(model, runIdx) {
   allMetrics[model.id] = { ...final, modelLabel:model.label, modelId:model.id };
 
   renderSummary(tid, model, final, rows.length);
-  saveRun(model, rows, final);
+  await saveRun(model, rows, final);
   clearProg(model.id); // run complete — discard checkpoint
   renderModelList();   // refresh download/resume badges
   setProg('inf',100,`Done — ${rows.length} rows`);
@@ -1085,13 +1132,16 @@ function normCat(s) {
 // ═══════════════════════════════════════════════════════════
 // Save / Download
 // ═══════════════════════════════════════════════════════════
-function saveRun(model, rows, metrics) {
-  // Auto-download CSV
-  dl(`${model.label}_results.csv`, buildCSV(rows), 'text/csv');
-  // Auto-download JSON summary (small delay to avoid browser blocking)
+async function saveRun(model, rows, metrics) {
+  const ts = new Date().toISOString();
+  const safeLabel = model.label.replace(/[^a-zA-Z0-9._-]/g, '_');
+  const csvFile  = `${safeLabel}_results.csv`;
+  const jsonFile = `${safeLabel}_summary.json`;
+
   const summary = {
     model: model.label, modelId: model.id,
-    timestamp: new Date().toISOString(),
+    timestamp: ts,
+    sampleSize: rows.length,
     metrics: {
       accuracy:     metrics.correct/metrics.total,
       precision:    metrics.precision,
@@ -1103,29 +1153,87 @@ function saveRun(model, rows, metrics) {
       total:metrics.total, correct:metrics.correct
     },
     byCategory: metrics.byCat,
+    csvFile,
     summary: genText(model.label, metrics,
       Object.entries(metrics.byCat).sort((a,b)=>b[1].correct/b[1].total-a[1].correct/a[1].total)[0],
       Object.entries(metrics.byCat).sort((a,b)=>a[1].correct/a[1].total-b[1].correct/b[1].total)[0],
       rows.length)
   };
-  setTimeout(()=>dl(`${model.label}_summary.json`, JSON.stringify(summary,null,2), 'application/json'), 600);
 
-  // localStorage
+  // Save CSV + JSON to ./results/ on disk via proxy server
+  const csvContent  = buildCSV(rows);
+  const jsonContent = JSON.stringify(summary, null, 2);
+  try {
+    await fetch(`/results/${encodeURIComponent(csvFile)}`,
+      {method:'POST', headers:{'Content-Type':'text/csv'}, body:csvContent});
+    await fetch(`/results/${encodeURIComponent(jsonFile)}`,
+      {method:'POST', headers:{'Content-Type':'application/json'}, body:jsonContent});
+  } catch(e) {
+    // Fallback: browser download if server unavailable
+    dl(csvFile,  csvContent,  'text/csv');
+    dl(jsonFile, jsonContent, 'application/json');
+  }
+
+  // Also persist in localStorage for instant sidebar refresh
   try {
     const runs = getSaved();
-    const idx = runs.findIndex(r=>r.modelId===model.id);
+    const idx  = runs.findIndex(r => r.modelId === model.id);
     const entry = {
       modelId:model.id, modelLabel:model.label,
-      timestamp:summary.timestamp,
+      timestamp:ts, sampleSize:rows.length,
       accuracy:metrics.correct/metrics.total,
       f1:metrics.f1, total:metrics.total,
       metrics:summary.metrics, byCat:metrics.byCat,
-      summaryText:summary.summary
+      summaryText:summary.summary, csvFile, jsonFile
     };
     if(idx>=0) runs[idx]=entry; else runs.push(entry);
     localStorage.setItem('dpRuns', JSON.stringify(runs));
   } catch(e){}
   renderSavedRuns();
+}
+
+// Auto-load saved runs from ./results/ on server startup
+async function loadResultsFromServer() {
+  try {
+    const r = await fetch('/results-index', {cache:'no-store'});
+    if (!r.ok) return;
+    const files = await r.json();
+    const jsonFiles = files.filter(f => f.name.endsWith('_summary.json'));
+    if (!jsonFiles.length) return;
+
+    const runs = [];
+    for (const f of jsonFiles) {
+      try {
+        const res = await fetch(`/results/${encodeURIComponent(f.name)}`, {cache:'no-store'});
+        if (!res.ok) continue;
+        const s = await res.json();
+        runs.push({
+          modelId:    s.modelId,
+          modelLabel: s.model,
+          timestamp:  s.timestamp,
+          sampleSize: s.sampleSize || s.metrics?.total,
+          accuracy:   s.metrics.accuracy,
+          f1:         s.metrics.f1,
+          total:      s.metrics.total,
+          metrics:    s.metrics,
+          byCat:      s.byCategory,
+          summaryText:s.summary,
+          csvFile:    s.csvFile,
+          jsonFile:   f.name
+        });
+      } catch(e) {}
+    }
+    if (runs.length) {
+      // Merge with localStorage (server wins on conflict)
+      const local = getSaved();
+      for (const r of runs) {
+        const i = local.findIndex(x => x.modelId === r.modelId);
+        if (i >= 0) local[i] = r; else local.push(r);
+      }
+      localStorage.setItem('dpRuns', JSON.stringify(local));
+      renderSavedRuns();
+    }
+  } catch(e) {}
 }
 
 function buildCSV(rows) {
@@ -1242,6 +1350,98 @@ function setDot(i, cls) {
 // ═══════════════════════════════════════════════════════════
 // Utilities
 // ═══════════════════════════════════════════════════════════
+// ── Browser cache management ─────────────────────────────────
+async function clearBrowserCache() {
+  const btn = event.target;
+  btn.disabled = true;
+  btn.textContent = '⏳ Clearing…';
+  try {
+    const names = await caches.keys();
+    await Promise.all(names.map(n => caches.delete(n)));
+    // Clear IndexedDB (WebGPU shader cache)
+    let dbCount = 0;
+    try {
+      const dbs = await indexedDB.databases();
+      dbCount = dbs.length;
+      await Promise.all(dbs.map(db => new Promise(res => {
+        const req = indexedDB.deleteDatabase(db.name);
+        req.onsuccess = res; req.onerror = res;
+      })));
+    } catch(e) {}
+    // Also clear the "downloaded" markers so Phase 1 re-runs
+    // (files are still on disk; proxy serves them instantly)
+    for (const key of Object.keys(localStorage)) {
+      if (key.startsWith('dpDL_')) localStorage.removeItem(key);
+    }
+    renderModelList();
+    btn.textContent = `✓ Cleared ${names.length} cache(s) + ${dbCount} IDB(s)`;
+    document.getElementById('cache-status').textContent = 'Cache API + IndexedDB cleared. Models reload from local disk.';
+    setTimeout(() => {
+      btn.textContent = '🗑 Clear Browser Cache';
+      btn.disabled = false;
+    }, 3000);
+  } catch(e) {
+    btn.textContent = '✗ Error: ' + e.message;
+    btn.disabled = false;
+  }
+}
+
+async function showCacheUsage() {
+  const el = document.getElementById('cache-status');
+  if (!el || !navigator.storage?.estimate) return;
+  try {
+    const {usage, quota} = await navigator.storage.estimate();
+    const usedMB  = (usage  / 1_048_576).toFixed(0);
+    const quotaMB = (quota  / 1_048_576).toFixed(0);
+    const pct = Math.round(usage / quota * 100);
+    el.textContent = `Browser cache: ${usedMB} MB / ${quotaMB} MB (${pct}%)`;
+    el.style.color = pct > 80 ? 'var(--red)' : pct > 60 ? 'var(--yellow)' : 'var(--text-dim)';
+  } catch(e) {}
+}
+
+// ── Stratified dataset sampler ───────────────────────────────
+// Picks `n` rows balanced across all Category × Dark-Pattern combos.
+// Each "bucket" = unique (Category, DarkPattern=Yes/No) pair.
+// We round-robin fill buckets until n rows are selected.
+function sampleDataset(mode) {
+  if (mode === 'all') return [...dataset];
+  const n = parseInt(mode);
+
+  // Build buckets keyed by category+dp
+  const buckets = new Map();
+  for (const row of dataset) {
+    const key = `${(row.Category||'').trim()}|${(row['Dark Pattern']||'').trim()}`;
+    if (!buckets.has(key)) buckets.set(key, []);
+    buckets.get(key).push(row);
+  }
+
+  // Deterministic shuffle within each bucket (use index as seed)
+  for (const [, arr] of buckets) {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor((i * 1.6180339887) % 1 * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+  }
+
+  const keys    = [...buckets.keys()];
+  const ptrs    = Object.fromEntries(keys.map(k => [k, 0]));
+  const result  = [];
+  let   changed = true;
+
+  while (result.length < n && changed) {
+    changed = false;
+    for (const k of keys) {
+      if (result.length >= n) break;
+      const arr = buckets.get(k);
+      if (ptrs[k] < arr.length) {
+        result.push(arr[ptrs[k]++]);
+        changed = true;
+      }
+    }
+  }
+  return result;
+}
+
 function trunc(s,n){ return s&&s.length>n ? s.slice(0,n)+'…' : (s||''); }
 function esc(s)  { return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 function esc2(s) { return (s||'').replace(/"/g,'""'); }

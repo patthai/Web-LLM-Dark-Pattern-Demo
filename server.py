@@ -18,6 +18,7 @@ import os
 import ssl
 import sys
 import threading
+import uuid
 import urllib.request
 import urllib.error
 from http.server import SimpleHTTPRequestHandler
@@ -29,9 +30,10 @@ from pathlib import Path
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
-HF_BASE   = "https://huggingface.co/mlc-ai"
-MODEL_DIR = Path("model")
-CHUNK     = 65536   # 64 KB read chunks
+HF_BASE     = "https://huggingface.co/mlc-ai"
+MODEL_DIR   = Path("model")
+RESULTS_DIR = Path("results")
+CHUNK       = 65536   # 64 KB read chunks
 
 # ── Shared progress state (thread-safe) ──────────────────────
 _prog_lock = threading.Lock()
@@ -63,7 +65,7 @@ class ProxyHandler(SimpleHTTPRequestHandler):
 
     def do_OPTIONS(self):
         self.send_response(200)
-        self.send_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS")
         self.end_headers()
 
     # ── Route requests ───────────────────────────────────────
@@ -71,6 +73,8 @@ class ProxyHandler(SimpleHTTPRequestHandler):
         path = self.path.split("?")[0]
         if path == "/model-progress":
             self._handle_progress()
+        elif path == "/results-index":
+            self._handle_results_index()
         elif path.startswith("/model/"):
             self._handle_model(head_only=False)
         else:
@@ -82,6 +86,53 @@ class ProxyHandler(SimpleHTTPRequestHandler):
             self._handle_model(head_only=True)
         else:
             super().do_HEAD()
+
+    def do_POST(self):
+        path = self.path.split("?")[0]
+        if path.startswith("/results/"):
+            self._handle_save_result(path)
+        else:
+            self.send_error(405)
+
+    # ── Save result file to ./results/ ───────────────────────
+    def _handle_save_result(self, path):
+        filename = os.path.basename(path[9:])   # strip /results/
+        if not filename:
+            self.send_error(400, "Missing filename"); return
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body   = self.rfile.read(length)
+            RESULTS_DIR.mkdir(exist_ok=True)
+            (RESULTS_DIR / filename).write_bytes(body)
+            resp = b'{"ok":true}'
+            self.send_response(200)
+            self.send_header("Content-Type",   "application/json")
+            self.send_header("Content-Length", str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+            print(f"  saved  results/{filename}", file=sys.stderr)
+        except Exception as e:
+            print(f"\n  Error saving result {filename}: {e}", file=sys.stderr)
+            try: self.send_error(500, str(e))
+            except Exception: pass
+
+    # ── List result files ────────────────────────────────────
+    def _handle_results_index(self):
+        RESULTS_DIR.mkdir(exist_ok=True)
+        files = sorted(
+            [{"name": f.name, "size": f.stat().st_size,
+              "mtime": f.stat().st_mtime}
+             for f in RESULTS_DIR.iterdir()
+             if f.is_file() and not f.name.startswith('.')],
+            key=lambda x: x["mtime"], reverse=True
+        )
+        data = json.dumps(files).encode()
+        self.send_response(200)
+        self.send_header("Content-Type",   "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control",  "no-store")
+        self.end_headers()
+        self.wfile.write(data)
 
     # ── /model-progress endpoint ─────────────────────────────
     def _handle_progress(self):
@@ -132,7 +183,8 @@ class ProxyHandler(SimpleHTTPRequestHandler):
 
     # ── Proxy from HuggingFace and cache to disk ─────────────
     def _proxy_and_cache(self, url, local_path, model_id, head_only=False):
-        tmp_path = local_path.with_suffix(local_path.suffix + ".tmp")
+        # Use a unique tmp file per thread to avoid rename races
+        tmp_path = local_path.with_suffix(local_path.suffix + f".{uuid.uuid4().hex[:8]}.tmp")
         try:
             req = urllib.request.Request(
                 url,
@@ -181,8 +233,12 @@ class ProxyHandler(SimpleHTTPRequestHandler):
                                     end="", file=sys.stderr, flush=True,
                                 )
 
-                # Atomic rename: only keep if fully downloaded
-                tmp_path.rename(local_path)
+                # Atomic rename: only keep if fully downloaded.
+                # Another thread may have already saved this file — that's fine.
+                try:
+                    tmp_path.replace(local_path)   # replace() is atomic & overwrites
+                except Exception:
+                    tmp_path.unlink(missing_ok=True)   # clean up our tmp; other thread won
                 _set_prog(model_id, name, 100, total, total, done=True)
                 if total > 0:
                     print(f"\r  {name}: 100%  {total/1_048_576:.1f} MB  ✓",
@@ -226,6 +282,7 @@ class ProxyHandler(SimpleHTTPRequestHandler):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", sys.argv[1] if len(sys.argv) > 1 else 8000))
     MODEL_DIR.mkdir(exist_ok=True)
+    RESULTS_DIR.mkdir(exist_ok=True)
     httpd = ThreadingHTTPServer(("", port), ProxyHandler)
     print(f"Serving  http://localhost:{port}/", file=sys.stderr)
     print(f"Cache    ./{MODEL_DIR}/", file=sys.stderr)

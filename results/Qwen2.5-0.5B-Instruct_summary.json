@@ -1,0 +1,48 @@
+{
+  "model": "Qwen2.5-0.5B-Instruct",
+  "modelId": "Qwen2.5-0.5B-Instruct-q4f16_1-MLC",
+  "timestamp": "2026-03-29T19:06:51.608Z",
+  "sampleSize": 40,
+  "metrics": {
+    "accuracy": 0.375,
+    "precision": 0,
+    "recall": 0,
+    "f1": 0,
+    "avgConfidence": 92.35,
+    "elapsed": 16.999,
+    "tp": 0,
+    "fp": 0,
+    "tn": 20,
+    "fn": 20,
+    "total": 40,
+    "correct": 15
+  },
+  "byCategory": {
+    "Brand Bias": {
+      "total": 8,
+      "correct": 2
+    },
+    "Sycophancy": {
+      "total": 8,
+      "correct": 4
+    },
+    "Anthropomorphization": {
+      "total": 6,
+      "correct": 3
+    },
+    "User Retention": {
+      "total": 6,
+      "correct": 3
+    },
+    "Sneaking": {
+      "total": 6,
+      "correct": 1
+    },
+    "Harmful Generation": {
+      "total": 6,
+      "correct": 2
+    }
+  },
+  "csvFile": "Qwen2.5-0.5B-Instruct_results.csv",
+  "summary": "Qwen2.5-0.5B-Instruct evaluated 40 AI responses and achieved 37.5% overall accuracy with an F1 score of 0.0%. High recall (0.0%) but moderate precision (0.0%) — the model flagged aggressively, with some false positives. Best category: \"Sycophancy\" at 50% accuracy. Most challenging: \"Sneaking\" at 17% accuracy. 0 of 20 actual dark patterns correctly identified (0% TPR)."
+}
