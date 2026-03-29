@@ -73,6 +73,24 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
 .pfill.dl{background:var(--yellow)}.pfill.inf{background:var(--green)}
 #os{font-size:11px;color:var(--text-dim);line-height:1.5;min-height:28px;margin-bottom:8px}
 
+/* real-time download card */
+#dlcard{display:none;background:var(--surface2);border:1px solid var(--border);
+  border-radius:8px;padding:10px 12px;margin-bottom:10px}
+#dlcard.active{display:block}
+#dlcard-title{font-size:11px;font-weight:600;color:var(--text-dim);
+  text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px}
+#dlcard-model{font-size:13px;font-weight:700;color:var(--text);margin-bottom:4px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#dlcard-file{font-size:10px;color:var(--text-dim);margin-bottom:6px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#dlcard-pbar-wrap{width:100%;height:10px;background:var(--surface);
+  border-radius:5px;overflow:hidden;margin-bottom:5px}
+#dlcard-pbar{height:100%;border-radius:5px;background:var(--yellow);
+  width:0%;transition:width .2s ease}
+#dlcard-stats{display:flex;justify-content:space-between;font-size:10px;color:var(--text-dim)}
+#dlcard-pct{font-size:22px;font-weight:800;color:var(--yellow);
+  text-align:center;line-height:1;margin:4px 0 2px}
+
 /* saved runs */
 .sri{padding:6px 8px;border-radius:4px;cursor:pointer;
   border:1px solid var(--border);margin-bottom:4px;transition:background .12s}
@@ -188,6 +206,20 @@ tr:last-child td{border-bottom:none}tr:hover td{background:rgba(255,255,255,.025
     <div class="sec">
       <h3>Progress</h3>
       <div id="os">Select models and click Run All.</div>
+
+      <!-- Real-time download card (shown during Phase 1) -->
+      <div id="dlcard">
+        <div id="dlcard-title">⬇ Downloading</div>
+        <div id="dlcard-model">—</div>
+        <div id="dlcard-file">—</div>
+        <div id="dlcard-pct">0%</div>
+        <div id="dlcard-pbar-wrap"><div id="dlcard-pbar"></div></div>
+        <div id="dlcard-stats">
+          <span id="dlcard-mb">0 MB</span>
+          <span id="dlcard-total">—</span>
+        </div>
+      </div>
+
       <div class="plabel"><span>Model Download</span><span id="dlpct">—</span></div>
       <div class="pbar"><div class="pfill dl" id="dlfill"></div></div>
       <div class="plabel"><span>Inference</span><span id="infpct">—</span></div>
@@ -215,8 +247,8 @@ tr:last-child td{border-bottom:none}tr:hover td{background:rgba(255,255,255,.025
           Results auto-save to your downloads folder after each model.</div>
           <div style="margin-top:16px;padding:10px 14px;background:var(--surface2);border-radius:6px;
             font-size:11px;color:var(--text-dim);display:inline-block;text-align:left">
-            <strong style="color:var(--yellow)">⚡ Tip:</strong> Serve via local server for best compatibility:<br>
-            <code style="background:var(--bg);padding:2px 6px;border-radius:3px">python3 -m http.server 8000</code>
+            <strong style="color:var(--yellow)">⚡ Tip:</strong> Use the proxy server to save models to disk:<br>
+            <code style="background:var(--bg);padding:2px 6px;border-radius:3px">python3 server.py 8000</code>
           </div>
         </div>
       </div>
@@ -283,7 +315,8 @@ function fmtVram(mb) {
   return mb >= 1024 ? `${(mb/1024).toFixed(1)} GB` : `${Math.round(mb)} MB`;
 }
 function shortLabel(id) {
-  return id.replace(/-q4f\d+_\d+-MLC$/i,'').replace(/-MLC$/i,'');
+  // Strip any quant suffix: -q0f16-MLC, -q4f16_1-MLC, -q3f16_1-MLC, plain -MLC
+  return id.replace(/-q\d\w*-MLC$/i,'').replace(/-MLC$/i,'');
 }
 
 const CATS = [
@@ -383,31 +416,38 @@ function validateModels() {
     if (cfg?.model_list?.length) {
       cfg.model_list.forEach(m => availableModelIds.add(m.model_id));
 
-      // Build MODELS from prebuiltAppConfig — instruct/chat only, q4f16_1 preferred
-      const seen = new Set();
-      const discovered = [];
-      for (const m of cfg.model_list) {
-        const id = m.model_id;
+      // Build MODELS from prebuiltAppConfig
+      // 1. Group all instruct/chat variants by base model name
+      // 2. Pick preferred quantization: q4f16_1 > q4f32_1 > q4f16_0 > q0f16 > first
+      const PREF = ['q4f16_1','q4f32_1','q4f16_0','q0f16','q0f32'];
+      const byBase = new Map(); // base → [{id, vramMB}]
+      for (const entry of cfg.model_list) {
+        const id = entry.model_id;
         if (!/instruct|chat/i.test(id)) continue;
         if (!/-MLC$/i.test(id)) continue;
-        // Deduplicate by base name, prefer q4f16_1 quant
-        const base = id.replace(/-q4f\d+_\d+-MLC$/i,'');
-        if (seen.has(base)) continue;
-        seen.add(base);
+        const base = id.replace(/-q\d\w*-MLC$/i,'').replace(/-MLC$/i,'');
+        if (!byBase.has(base)) byBase.set(base, []);
+        byBase.get(base).push({ id, vramMB: entry.vram_required_MB ?? null });
+      }
+      const discovered = [];
+      for (const [, variants] of byBase) {
+        let chosen = null;
+        for (const q of PREF) {
+          chosen = variants.find(v => v.id.toLowerCase().includes(q));
+          if (chosen) break;
+        }
+        if (!chosen) chosen = variants[0];
         discovered.push({
-          id, label: shortLabel(id),
-          sz: parseSzStr(id), sizeB: parseSizeB(id),
+          id: chosen.id,
+          label: shortLabel(chosen.id),
+          sz: parseSzStr(chosen.id),
+          sizeB: parseSizeB(chosen.id),
+          vramMB: chosen.vramMB,
         });
       }
       if (discovered.length) {
         MODELS = discovered.sort((a,b) => a.sizeB - b.sizeB);
       }
-      // Patch vram_required_MB onto discovered models from the config entry
-      const vramMap = {};
-      for (const entry of cfg.model_list) vramMap[entry.model_id] = entry.vram_required_MB;
-      MODELS.forEach(m => {
-        m.vramMB = vramMap[m.id] !== undefined ? vramMap[m.id] : null;
-      });
     }
   } catch(e) { console.warn('Could not read prebuiltAppConfig', e); }
 
@@ -464,8 +504,12 @@ function renderModelList() {
     else if(partial) tag=`<span style="color:var(--accent-light);font-size:10px" title="Resume from row ${prog.nextIdx}">↩${prog.nextIdx}</span>`;
     else if(cached)  tag=`<span style="color:var(--green);font-size:10px">⬇✓</span>`;
 
-    // Use saved state if user changed it; otherwise default-check ≤4B models
-    const defaultChecked = !unavail && m.sizeB <= 4;
+    // Use saved state if user changed it; otherwise default-check specific 6 models
+    const DEFAULT_LABELS = new Set([
+      'SmolLM2-360M-Instruct','Qwen2.5-0.5B-Instruct','Qwen2-0.5B-Instruct',
+      'Llama-3.2-1B-Instruct','TinyLlama-1.1B-Chat-v1.0','Qwen2.5-1.5B-Instruct'
+    ]);
+    const defaultChecked = !unavail && DEFAULT_LABELS.has(m.label);
     const checked = m.id in prevState ? prevState[m.id] : defaultChecked;
 
     // Show VRAM in MB/GB when available; always show param size alongside
@@ -663,28 +707,105 @@ function endRun(msg) {
 // Model loading
 // ═══════════════════════════════════════════════════════════
 
+// Build custom appConfig so WebLLM fetches from our local proxy server.
+// The proxy (server.py) intercepts /model/ requests, saves files to disk,
+// and serves them from disk on subsequent loads.
+function buildAppConfig(modelId) {
+  try {
+    const cfg = webllm.prebuiltAppConfig;
+    const entry = cfg?.model_list?.find(e => e.model_id === modelId);
+    if (!entry) return undefined;
+    const origin = window.location.origin;
+    // Only reroute when served via HTTP (not file://)
+    if (!origin.startsWith('http')) return undefined;
+    // WebLLM ModelRecord uses 'model' (not 'model_url') as the weights URL field
+    const localUrl = `${origin}/model/${modelId}/`;
+    console.log(`[appConfig] ${modelId} → ${localUrl}`);
+    return {
+      model_list: [{ ...entry, model: localUrl }]
+    };
+  } catch(e) { return undefined; }
+}
+
+// ── Real-time download progress polling ──────────────────────
+let _dlPoller = null;
+function startDLPoller(modelLabel) {
+  stopDLPoller();
+  const card = document.getElementById('dlcard');
+  const cardModel = document.getElementById('dlcard-model');
+  const cardFile  = document.getElementById('dlcard-file');
+  const cardPct   = document.getElementById('dlcard-pct');
+  const cardBar   = document.getElementById('dlcard-pbar');
+  const cardMb    = document.getElementById('dlcard-mb');
+  const cardTotal = document.getElementById('dlcard-total');
+  card.classList.add('active');
+  cardModel.textContent = modelLabel;
+  cardFile.textContent  = 'Connecting…';
+  cardPct.textContent   = '0%';
+  cardBar.style.width   = '0%';
+
+  _dlPoller = setInterval(async () => {
+    try {
+      const r = await fetch('/model-progress', {cache:'no-store'});
+      if(!r.ok) return;
+      const data = await r.json();
+      const entries = Object.values(data);
+      if(!entries.length) return;
+      // Show the entry with lowest pct (currently downloading)
+      const active = entries.filter(e => !e.done);
+      const entry  = active.length ? active[0] : entries[entries.length-1];
+      const pct    = entry.pct || 0;
+      const mb     = (entry.downloaded||0) / 1_048_576;
+      const totMb  = (entry.total||0) / 1_048_576;
+      cardFile.textContent  = entry.file || '—';
+      cardPct.textContent   = `${pct}%`;
+      cardBar.style.width   = `${pct}%`;
+      cardMb.textContent    = `${mb.toFixed(1)} MB`;
+      cardTotal.textContent = totMb > 0 ? `/ ${totMb.toFixed(1)} MB` : '';
+      // Also update the mini progress bar
+      setProg('dl', pct, `${pct}%`);
+    } catch(e) {}
+  }, 300);
+}
+function stopDLPoller() {
+  if(_dlPoller) { clearInterval(_dlPoller); _dlPoller = null; }
+  const card = document.getElementById('dlcard');
+  if(card) card.classList.remove('active');
+}
+
 // Phase 1: download weights to browser cache, then unload GPU memory
 async function downloadModel(m) {
   setProg('dl',0,`Downloading ${m.label}…`);
+  startDLPoller(m.label);
   if(engine){ try{ await engine.unload(); }catch(e){} engine=null; }
-  const eng = await webllm.CreateMLCEngine(m.id, {
-    initProgressCallback: rep => {
-      const pct = Math.round((rep.progress||0)*100);
-      setProg('dl', pct, rep.text||`${pct}%`);
-    }
-  });
-  await eng.unload(); // free GPU; weights stay in browser Cache API
+  const appCfg = buildAppConfig(m.id);
+  try {
+    const eng = await webllm.CreateMLCEngine(m.id, {
+      appConfig: appCfg,
+      initProgressCallback: rep => {
+        const pct = Math.round((rep.progress||0)*100);
+        const txt = (rep.text||'').replace(/\[.*?\]/,'').trim() || `${pct}%`;
+        setOS(`⬇ <strong>${m.label}</strong>: ${pct}%<br><span style="font-size:10px;color:var(--text-dim)">${txt}</span>`);
+      }
+    });
+    await eng.unload();
+  } finally {
+    stopDLPoller();
+  }
   setProg('dl',100,`${m.label} cached ✓`);
+  setOS(`✓ ${m.label} downloaded`);
 }
 
 // Phase 2: load model from cache for inference
 async function loadModel(m) {
-  setProg('dl',0,`Loading ${m.label} from cache…`);
+  setProg('dl',0,`Loading ${m.label}…`);
   if(engine){ try{ await engine.unload(); }catch(e){} engine=null; }
+  const appCfg = buildAppConfig(m.id);
   engine = await webllm.CreateMLCEngine(m.id, {
+    appConfig: appCfg,
     initProgressCallback: rep => {
       const pct = Math.round((rep.progress||0)*100);
-      setProg('dl', pct, rep.text||`${pct}%`);
+      setProg('dl', pct, `${pct}%`);
     }
   });
   setProg('dl',100,`${m.label} ready`);

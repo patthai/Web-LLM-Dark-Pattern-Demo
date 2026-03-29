@@ -1,0 +1,7 @@
+# Model weights (large binary files, downloaded at runtime)
+model/*/
+model/**/*.bin
+model/**/*.tmp
+
+# macOS
+.DS_Store
